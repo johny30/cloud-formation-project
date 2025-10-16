@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Softcoded deployment of IAM, Glue, Step Functions, SQS, and SNS
+
+Parameters:
+  GlueJobName:
+    Type: String
+    Default: MyDataProcessingJob
+
+  GlueScriptLocation:
+    Type: String
+    Description: S3 path to Glue script (e.g., s3://your-bucket/scripts/glue-script.py)
+
+  SQSQueueName:
+    Type: String
+    Default: MyProcessingQueue
+
+  SNSTopicName:
+    Type: String
+    Default: MyNotificationTopic
+
+  StateMachineName:
+    Type: String
+    Default: MyWorkflowStateMachine
+
+Resources:
+
+  ### IAM Role ###
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GlueJobName}-ExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${GlueJobName}-Policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:GetJob
+                  - glue:BatchStopJobRun
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - sqs:SendMessage
+                  - sns:Publish
+                Resource: "*"
+
+  ### SQS Queue ###
+  MyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref SQSQueueName
+
+  ### SNS Topic ###
+  MyTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+
+  ### Glue Job ###
+  MyGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref GlueJobName
+      Role: !GetAtt ExecutionRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Ref GlueScriptLocation
+        PythonVersion: 3
+      GlueVersion: "3.0"
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  ### Step Function ###
+  MyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref StateMachineName
+      RoleArn: !GetAtt ExecutionRole.Arn
+      DefinitionString:
+        Fn::Sub:
+          - |
+            {
+              "Comment": "Workflow to orchestrate Glue, SQS, and SNS",
+              "StartAt": "Start",
+              "States": {
+                "Start": {
+                  "Type": "Pass",
+                  "Next": "TriggerGlueJob"
+                },
+                "TriggerGlueJob": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                  "Parameters": {
+                    "JobName": "${GlueJobName}"
+                  },
+                  "Next": "SendToSQS"
+                },
+                "SendToSQS": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sqs:sendMessage",
+                  "Parameters": {
+                    "QueueUrl": "${QueueUrl}",
+                    "MessageBody": "Glue job completed"
+                  },
+                  "Next": "SendToSNS"
+                },
+                "SendToSNS": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sns:publish",
+                  "Parameters": {
+                    "TopicArn": "${TopicArn}",
+                    "Message": "Workflow completed successfully"
+                  },
+                  "Next": "Stop"
+                },
+                "Stop": {
+                  "Type": "Succeed"
+                }
+              }
+            }
+          - {
+              GlueJobName: !Ref GlueJobName,
+              QueueUrl: !Ref MyQueue,
+              TopicArn: !Ref MyTopic
+            }
